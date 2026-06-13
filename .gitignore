@@ -1,5 +1,5 @@
 # Build artifacts
-/terraform-provider-aruba-aos
+/terraform-provider-mikrotik-routeros
 /dist/
 *.exe
 

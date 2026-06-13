@@ -13,6 +13,8 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -24,21 +26,20 @@ var (
 	_ resource.ResourceWithImportState = (*objectResource)(nil)
 )
 
-// NewObjectResource constructs the generic aruba_aos_object resource.
+// NewObjectResource constructs the generic routeros_object resource.
 func NewObjectResource() resource.Resource { return &objectResource{} }
 
 type objectResource struct {
 	client *routeros.Client
 }
 
-// objectModel is the state/plan shape for aruba_aos_object.
+// objectModel is the state/plan shape for routeros_object.
 type objectModel struct {
-	ID           types.String `tfsdk:"id"`
-	Path         types.String `tfsdk:"path"`
-	CreatePath   types.String `tfsdk:"create_path"`
-	DeleteMethod types.String `tfsdk:"delete_method"`
-	DeleteBody   types.String `tfsdk:"delete_body"`
-	Body         types.String `tfsdk:"body"`
+	ID        types.String `tfsdk:"id"`
+	Path      types.String `tfsdk:"path"`
+	ObjectID  types.String `tfsdk:"object_id"`
+	Singleton types.Bool   `tfsdk:"singleton"`
+	Body      types.String `tfsdk:"body"`
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -47,43 +48,45 @@ func (r *objectResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A generic ArubaOS-Switch REST resource addressed by its `/rest/v8` path. " +
-			"Covers 100% of the AOS-S API: any singleton (`system`, `stp`, `dns`, `lldp`) or " +
-			"collection item (`vlans/40`, `vlans-ports/40-3`, `ports/5`, `snmp-server/communities/public`). " +
-			"`body` declares only the keys this resource manages; device-returned keys outside `body` are " +
-			"ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
+		MarkdownDescription: "A generic RouterOS REST resource addressed by its `/rest` menu path. " +
+			"Covers 100% of the RouterOS v7+ REST API: any collection item (`ip/address`, " +
+			"`interface/vlan`, `ip/firewall/filter`, `ip/dhcp-server/lease`) or singleton menu " +
+			"(`system/identity`, `ip/dns`, `system/ntp/client`, `snmp`). `body` declares only the " +
+			"keys this resource manages; device-returned keys outside `body` are ignored for drift, " +
+			"so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Resource id — equal to `path`.",
+				MarkdownDescription: "Resource id — `<path>` for a singleton, `<path>/<object_id>` for a collection item.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"path": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "Addressed resource path under `/rest/v8` (leading slash optional), " +
-					"used for GET/PUT/DELETE. E.g. `vlans/40`, `system`, `vlans-ports/40-3`.",
+				MarkdownDescription: "RouterOS menu path under `/rest` (leading slash optional), e.g. " +
+					"`ip/address`, `interface/vlan`, `system/identity`. ForceNew.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"create_path": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Collection path to POST to on create (e.g. `vlans` while `path` is `vlans/40`). " +
-					"When unset, create is an idempotent PUT to `path`. Carry it in the import id " +
-					"(`<path>|<create_path>`) so an imported resource matches config and lands at 0-diff.",
+			"object_id": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "RouterOS `.id` of the managed item (e.g. `*1`, or a named key). " +
+					"Captured from the create reply for a collection item; empty for a singleton.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"delete_method": schema.StringAttribute{
+			"singleton": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "How to destroy: `DELETE` (default), `PUT` (send `delete_body` to `path` — " +
-					"reset a singleton to default), or `NONE` (no-op for un-deletable singletons). Carry it in the " +
-					"import id (`<path>|<create_path>|<delete_method>`) to match config.",
-			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON body PUT to `path` on destroy when `delete_method = \"PUT\"`. Import id field 4.",
+				Computed: true,
+				MarkdownDescription: "Set true for a settings menu that has no item list and is not " +
+					"add/deletable (`system/identity`, `ip/dns`, `system/ntp/client`, `snmp`). Create/Update " +
+					"PATCH the menu path directly and Delete is a no-op. Default false (a collection item: " +
+					"PUT to add, DELETE to remove). ForceNew.",
+				Default:       booldefault.StaticBool(false),
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
 			},
 			"body": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "JSON object of the declared (managed) attributes. State holds the full " +
-					"device object; drift is detected only on these keys.",
+				MarkdownDescription: "JSON object of the declared (managed) attributes. RouterOS encodes " +
+					"all values as strings. State holds the full device object; drift is detected only on " +
+					"these keys.",
 				PlanModifiers: []planmodifier.String{subsetSuppress{}},
 			},
 		},
@@ -103,24 +106,36 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
-// normPath ensures a leading slash.
+// normPath ensures a leading slash and trims a trailing one.
 func normPath(p string) string {
 	p = strings.TrimSpace(p)
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	return p
+	return strings.TrimSuffix(p, "/")
 }
 
-// parentCollection returns the collection path for an item path by dropping the
-// last segment: "/vlans-ports/58-41" -> "/vlans-ports", "/vlans/58" -> "/vlans".
-// Returns "" for a top-level singleton (no parent).
-func parentCollection(p string) string {
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
+// itemPath joins a menu path and a RouterOS .id into the addressable item path.
+// The .id (e.g. "*1") is appended verbatim.
+func itemPath(menu, id string) string {
+	return normPath(menu) + "/" + id
+}
+
+// extractID pulls the RouterOS `.id` field from a JSON object body.
+func extractID(raw []byte) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
 		return ""
 	}
-	return p[:i]
+	v, ok := m[".id"]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -134,29 +149,32 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	var err error
-	if !m.CreatePath.IsNull() && m.CreatePath.ValueString() != "" {
-		// Explicit collection POST (e.g. /vlans).
-		_, err = r.client.Post(normPath(m.CreatePath.ValueString()), body)
-	} else {
-		// Idempotent PUT to the item path; if the item doesn't exist yet
-		// (AOS-S replies 404 to PUT on a not-yet-present collection item, e.g.
-		// a new vlans-ports membership), fall back to POSTing the parent
-		// collection. This makes the generic resource handle both upsert-PUT
-		// singletons and POST-create collections without an explicit create_path.
-		p := normPath(m.Path.ValueString())
-		_, err = r.client.Put(p, body)
-		if err != nil && routeros.NotFound(err) {
-			if parent := parentCollection(p); parent != "" {
-				_, err = r.client.Post(parent, body)
-			}
+	menu := normPath(m.Path.ValueString())
+	if m.Singleton.ValueBool() {
+		// Settings menu — PATCH the menu path directly; no .id.
+		if _, err := r.client.Patch(menu, body); err != nil {
+			resp.Diagnostics.AddError("RouterOS create (singleton PATCH) failed", err.Error())
+			return
 		}
+		m.ObjectID = types.StringValue("")
+		m.ID = types.StringValue(menu)
+	} else {
+		// Collection item — PUT to add; the reply echoes the created object,
+		// including its `.id`.
+		raw, err := r.client.Put(menu, body)
+		if err != nil {
+			resp.Diagnostics.AddError("RouterOS create (PUT) failed", err.Error())
+			return
+		}
+		id := extractID(raw)
+		if id == "" {
+			resp.Diagnostics.AddError("RouterOS create: no .id in reply",
+				fmt.Sprintf("PUT %s did not return a `.id`: %s", menu, string(raw)))
+			return
+		}
+		m.ObjectID = types.StringValue(id)
+		m.ID = types.StringValue(itemPath(menu, id))
 	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S create failed", err.Error())
-		return
-	}
-	m.ID = m.Path
 	// Store the declared body verbatim so the create plan/state are consistent;
 	// the next refresh (Read) replaces it with the full device object.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
@@ -168,24 +186,39 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := r.client.Get(normPath(m.Path.ValueString()))
+	menu := normPath(m.Path.ValueString())
+	readPath := menu
+	if !m.Singleton.ValueBool() {
+		if m.ObjectID.IsNull() || m.ObjectID.ValueString() == "" {
+			// No id to address the item — treat as gone.
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		readPath = itemPath(menu, m.ObjectID.ValueString())
+	}
+	raw, err := r.client.Get(readPath)
 	if err != nil {
 		if routeros.NotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("RouterOS read failed", err.Error())
+		return
+	}
+	// A GET of a deleted collection item can come back as an empty array/object
+	// instead of a 404 — treat that as gone too.
+	if isEmptyResponse(raw) && !m.Singleton.ValueBool() {
+		resp.State.RemoveResource(ctx)
 		return
 	}
 	// Store the full device object (compacted). The subset plan modifier
 	// reconciles it against the declared config body at plan time.
 	compact, err := compactJSON(raw)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("RouterOS read: invalid JSON from device", err.Error())
 		return
 	}
 	m.Body = types.StringValue(compact)
-	m.ID = m.Path
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -195,16 +228,28 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// object_id is computed and carried from prior state through the plan.
+	var state objectModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	m.ObjectID = state.ObjectID
+	m.ID = state.ID
 	body := []byte(m.Body.ValueString())
 	if !json.Valid(body) {
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	if _, err := r.client.Put(normPath(m.Path.ValueString()), body); err != nil {
-		resp.Diagnostics.AddError("AOS-S update failed", err.Error())
+	menu := normPath(m.Path.ValueString())
+	patchPath := menu
+	if !m.Singleton.ValueBool() {
+		patchPath = itemPath(menu, m.ObjectID.ValueString())
+	}
+	if _, err := r.client.Patch(patchPath, body); err != nil {
+		resp.Diagnostics.AddError("RouterOS update (PATCH) failed", err.Error())
 		return
 	}
-	m.ID = m.Path
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -214,49 +259,38 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	method := "DELETE"
-	if !m.DeleteMethod.IsNull() && m.DeleteMethod.ValueString() != "" {
-		method = strings.ToUpper(m.DeleteMethod.ValueString())
+	if m.Singleton.ValueBool() {
+		// Settings menu — nothing to delete; just drop from state.
+		return
 	}
-	var err error
-	switch method {
-	case "NONE":
-		// Singleton that cannot be deleted (e.g. /system); just drop from state.
-	case "PUT":
-		if m.DeleteBody.IsNull() {
-			resp.Diagnostics.AddError("delete_method=PUT requires delete_body", "no reset body provided")
-			return
-		}
-		_, err = r.client.Put(normPath(m.Path.ValueString()), []byte(m.DeleteBody.ValueString()))
-	default: // DELETE
-		_, err = r.client.Delete(normPath(m.Path.ValueString()))
-		if err != nil && routeros.NotFound(err) {
-			err = nil // already gone
-		}
+	if m.ObjectID.IsNull() || m.ObjectID.ValueString() == "" {
+		return // never created / already gone
 	}
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S delete failed", err.Error())
+	delPath := itemPath(normPath(m.Path.ValueString()), m.ObjectID.ValueString())
+	if _, err := r.client.Delete(delPath); err != nil && !routeros.NotFound(err) {
+		resp.Diagnostics.AddError("RouterOS delete failed", err.Error())
 	}
 }
 
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import id is a pipe-delimited tuple so the imported state matches the
-	// config's operational hints exactly (→ 0-diff, no spurious update/replace):
-	//   <path>[|<create_path>[|<delete_method>[|<delete_body>]]]
-	// Empty fields are treated as null. Body is populated on the following Read.
-	parts := strings.Split(req.ID, "|")
+	// Import id is a pipe-delimited tuple so the imported state matches config
+	// exactly (→ 0-diff, no spurious update/replace):
+	//   <path>[|<object_id>]
+	// A bare <path> imports a singleton (object_id empty, singleton true). A
+	// <path>|<object_id> imports a collection item. Body is populated on the
+	// following Read.
+	parts := strings.SplitN(req.ID, "|", 2)
+	menu := normPath(parts[0])
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[0])...)
-	setOpt := func(p string, i int) {
-		if i < len(parts) && parts[i] != "" {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), parts[i])...)
-		} else {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), types.StringNull())...)
-		}
+	if len(parts) == 2 && parts[1] != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("object_id"), parts[1])...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), false)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), itemPath(menu, parts[1]))...)
+	} else {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("object_id"), types.StringValue(""))...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), true)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), menu)...)
 	}
-	setOpt("create_path", 1)
-	setOpt("delete_method", 2)
-	setOpt("delete_body", 3)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
 }
 
@@ -331,4 +365,11 @@ func compactJSON(raw []byte) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// isEmptyResponse reports whether raw is an empty JSON array, empty object, or
+// JSON null — RouterOS sometimes returns these for a missing collection item.
+func isEmptyResponse(raw []byte) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "[]" || s == "{}" || s == "null"
 }

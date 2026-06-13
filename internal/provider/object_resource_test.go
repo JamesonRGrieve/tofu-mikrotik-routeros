@@ -12,44 +12,44 @@ func TestSubsetMatches(t *testing.T) {
 	}{
 		{
 			name:        "config subset of full device object — match (0-diff)",
-			prior:       `{"vlan_id":40,"name":"IOT","uri":"/vlans/40","type":"VT_STATIC","is_voice_enabled":false}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{".id":"*1","address":"192.168.88.1/24","interface":"bridge","network":"192.168.88.0","dynamic":"false"}`,
+			cfg:         `{"address":"192.168.88.1/24","interface":"bridge"}`,
 			wantMatched: true,
 		},
 		{
 			name:        "declared key drifted — no match (update)",
-			prior:       `{"vlan_id":40,"name":"IOT-OLD","uri":"/vlans/40"}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{".id":"*1","address":"192.168.88.1/24","interface":"ether1"}`,
+			cfg:         `{"address":"192.168.88.1/24","interface":"bridge"}`,
 			wantMatched: false,
 		},
 		{
 			name:        "declared key missing on device — no match",
-			prior:       `{"vlan_id":40,"uri":"/vlans/40"}`,
-			cfg:         `{"vlan_id":40,"name":"IOT"}`,
+			prior:       `{".id":"*1","address":"192.168.88.1/24"}`,
+			cfg:         `{"address":"192.168.88.1/24","interface":"bridge"}`,
 			wantMatched: false,
 		},
 		{
 			name:        "key order / whitespace insensitive — match",
-			prior:       `{"name":"IOT","vlan_id":40}`,
-			cfg:         "{\n  \"vlan_id\": 40,\n  \"name\": \"IOT\"\n}",
+			prior:       `{"name":"gw","comment":"core"}`,
+			cfg:         "{\n  \"comment\": \"core\",\n  \"name\": \"gw\"\n}",
 			wantMatched: true,
 		},
 		{
-			name:        "nested object value compared structurally — match",
-			prior:       `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.1"},"name":"sw"}`,
-			cfg:         `{"default_gateway":{"octets":"192.168.2.1","version":"IAV_IP_V4"}}`,
+			name:        "RouterOS string-encoded values compared as strings — match",
+			prior:       `{".id":"*3","disabled":"false","mtu":"1500"}`,
+			cfg:         `{"disabled":"false","mtu":"1500"}`,
 			wantMatched: true,
 		},
 		{
-			name:        "nested object value drift — no match",
-			prior:       `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.1"}}`,
-			cfg:         `{"default_gateway":{"version":"IAV_IP_V4","octets":"192.168.2.254"}}`,
+			name:        "string-encoded value drift — no match",
+			prior:       `{".id":"*3","mtu":"1500"}`,
+			cfg:         `{"mtu":"1480"}`,
 			wantMatched: false,
 		},
 		{
 			name:        "list value compared in order — match",
-			prior:       `{"tagged":[40,50,58,82],"id":"Trk1"}`,
-			cfg:         `{"tagged":[40,50,58,82]}`,
+			prior:       `{".id":"*1","dns-servers":["1.1.1.1","8.8.8.8"]}`,
+			cfg:         `{"dns-servers":["1.1.1.1","8.8.8.8"]}`,
 			wantMatched: true,
 		},
 		{
@@ -70,10 +70,12 @@ func TestSubsetMatches(t *testing.T) {
 
 func TestNormPath(t *testing.T) {
 	for in, want := range map[string]string{
-		"vlans/40":  "/vlans/40",
-		"/vlans/40": "/vlans/40",
-		" system ":  "/system",
-		"/system":   "/system",
+		"ip/address":         "/ip/address",
+		"/ip/address":        "/ip/address",
+		" system/identity ":  "/system/identity",
+		"/system/identity":   "/system/identity",
+		"ip/address/":        "/ip/address",
+		"/interface/vlan/*1": "/interface/vlan/*1",
 	} {
 		if got := normPath(in); got != want {
 			t.Errorf("normPath(%q) = %q, want %q", in, got, want)
@@ -81,16 +83,53 @@ func TestNormPath(t *testing.T) {
 	}
 }
 
-func TestParentCollection(t *testing.T) {
-	for in, want := range map[string]string{
-		"/vlans-ports/58-41":               "/vlans-ports",
-		"/vlans/58":                        "/vlans",
-		"/vlans/81/ipaddresses/IAAM-1.2.3": "/vlans/81/ipaddresses",
-		"/stp":                             "",
-		"/system":                          "",
+func TestItemPath(t *testing.T) {
+	cases := []struct {
+		menu, id, want string
+	}{
+		{"ip/address", "*1", "/ip/address/*1"},
+		{"/interface/vlan", "*A", "/interface/vlan/*A"},
+		{"ip/dhcp-server/lease", "*F", "/ip/dhcp-server/lease/*F"},
+	}
+	for _, tc := range cases {
+		if got := itemPath(tc.menu, tc.id); got != tc.want {
+			t.Errorf("itemPath(%q,%q) = %q, want %q", tc.menu, tc.id, got, tc.want)
+		}
+	}
+}
+
+func TestExtractID(t *testing.T) {
+	cases := []struct {
+		name, raw, want string
+	}{
+		{"asterisk id", `{".id":"*7","address":"10.0.0.1/24"}`, "*7"},
+		{"named id", `{".id":"bridge1","name":"bridge1"}`, "bridge1"},
+		{"no id field", `{"address":"10.0.0.1/24"}`, ""},
+		{"not an object (array)", `[{".id":"*1"}]`, ""},
+		{"invalid json", `nope`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractID([]byte(tc.raw)); got != tc.want {
+				t.Errorf("extractID(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsEmptyResponse(t *testing.T) {
+	for in, want := range map[string]bool{
+		"":               true,
+		"  ":             true,
+		"[]":             true,
+		"{}":             true,
+		"null":           true,
+		`[{".id":"*1"}]`: false,
+		`{".id":"*1"}`:   false,
+		"\n  []  \n":     true,
 	} {
-		if got := parentCollection(in); got != want {
-			t.Errorf("parentCollection(%q) = %q, want %q", in, got, want)
+		if got := isEmptyResponse([]byte(in)); got != want {
+			t.Errorf("isEmptyResponse(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

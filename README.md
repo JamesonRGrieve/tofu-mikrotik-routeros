@@ -1,42 +1,54 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# terraform-provider-aruba-aos
+# terraform-provider-mikrotik-routeros
 
-A native OpenTofu/Terraform provider for **ArubaOS-Switch (AOS-S)** switches —
-the ProVision/ProCurve-lineage 2530 / 2920 / 2930F running 16.x firmware — via
-the **REST API v8** (HTTPS, cookie-session auth).
+A native OpenTofu/Terraform provider for **MikroTik RouterOS v7+** routers via
+the **REST API** (`/rest`, HTTP Basic auth, HTTPS or HTTP).
 
-> **Not ArubaOS-CX.** The official `aruba/terraform-provider-aoscx` targets the
-> newer AOS-CX line (6300/8320/…) and does **not** manage AOS-S switches. AOS-S
-> has no upstream provider; this fills that gap. If you have a CX switch, use
-> the official one.
+> Requires RouterOS **7.x or later** with the `www-ssl` (HTTPS) or `www` (HTTP,
+> v7.9+) service enabled. The REST API is not available on RouterOS 6.x.
 
 ## Why generic
 
-AOS-S exposes a broad, stable REST surface (`/rest/v8/...`): singletons
-(`system`, `stp`, `dns`, `lldp`, `snmp-server`, `syslog`) and collections
-(`vlans/{vid}`, `vlans-ports/{vid}-{port}`, `ports/{id}`,
-`snmp-server/communities/{name}`, `stp/ports/{id}`, …). Rather than hand-code a
-resource per feature (and chase firmware additions forever), this provider is
-**generic over the API** — one resource and one data source address *any* path.
-That is **100% feature coverage** by construction.
+RouterOS exposes a clean REST mapping over its entire menu tree (`/rest/...`):
+collections — `ip/address`, `interface/vlan`, `ip/firewall/filter`,
+`ip/dhcp-server/lease`, `routing/ospf/instance`, … — and singletons —
+`system/identity`, `ip/dns`, `system/ntp/client`, `snmp`, …. Rather than
+hand-code a resource per menu (and chase RouterOS additions forever), this
+provider is **generic over the API** — one resource and one data source address
+*any* path. That is **100% feature coverage** by construction.
+
+## How the REST API maps
+
+| Operation | Verb | Path |
+|-----------|------|------|
+| List a menu | `GET` | `/rest/<menu>` |
+| Read one item | `GET` | `/rest/<menu>/<id>` |
+| Add an item | `PUT` | `/rest/<menu>` (reply echoes the created object incl. its `.id`) |
+| Update an item | `PATCH` | `/rest/<menu>/<id>` |
+| Update a singleton | `PATCH` | `/rest/<menu>` |
+| Delete an item | `DELETE` | `/rest/<menu>/<id>` |
+
+The id is RouterOS's `.id` (e.g. `*1`, or a named key). JSON bodies are flat
+maps; RouterOS encodes all values as strings.
 
 ## Resources
 
-### `arubaos_object` (resource)
+### `routeros_object` (resource)
 
-CRUD + `ImportState` for any addressable AOS-S resource.
+CRUD + `ImportState` for any addressable RouterOS resource.
 
 ```hcl
-resource "arubaos_object" "vlan_iot" {
-  path        = "vlans/40"   # GET/PUT/DELETE target
-  create_path = "vlans"      # POST here on create (omit to create via PUT path)
-  body        = jsonencode({ vlan_id = 40, name = "IOT" })
+# Collection item — PUT to add, PATCH/DELETE by captured .id.
+resource "routeros_object" "lan_addr" {
+  path = "ip/address"
+  body = jsonencode({ address = "192.168.88.1/24", interface = "bridge" })
 }
 
-resource "arubaos_object" "system" {
-  path          = "system"
-  delete_method = "NONE"     # singleton — cannot be deleted
-  body          = jsonencode({ name = "house-aruba-2530" })
+# Singleton settings menu — PATCH the menu path; no add/delete.
+resource "routeros_object" "identity" {
+  path      = "system/identity"
+  singleton = true
+  body      = jsonencode({ name = "lab-rb5009" })
 }
 ```
 
@@ -45,22 +57,31 @@ manage. State holds the full device object; a plan modifier suppresses the diff
 when every declared key already matches the device, so:
 
 - importing an existing resource (`tofu import` / `import {}` block) lands at
-  **0-diff** with no apply against the switch, and
+  **0-diff** with no apply against the router, and
 - the provider never clobbers device fields you didn't declare.
 
 | Attribute | | Meaning |
 |-----------|---|---------|
-| `path` | required, ForceNew | addressed path under `/rest/v8` (leading slash optional) |
+| `path` | required, ForceNew | RouterOS menu path under `/rest` (leading slash optional) |
 | `body` | required | JSON object of the keys you manage |
-| `create_path` | optional, ForceNew | collection to `POST` to on create; omit → create via idempotent `PUT path` |
-| `delete_method` | optional | `DELETE` (default), `PUT` (send `delete_body` — reset a singleton), or `NONE` |
-| `delete_body` | optional | reset body for `delete_method = "PUT"` |
-| `id` | computed | equals `path` |
+| `singleton` | optional, ForceNew | `true` for a settings menu (PATCH path; no add/delete). Default `false`. |
+| `object_id` | computed | RouterOS `.id` of the item (`*1`, named key); empty for a singleton |
+| `id` | computed | `<path>` for a singleton, `<path>/<object_id>` for an item |
 
-### `arubaos_object` (data source)
+#### Import ids
+
+```
+# singleton: bare path
+tofu import routeros_object.identity 'system/identity'
+
+# collection item: path|<.id>
+tofu import routeros_object.lan_addr 'ip/address|*1'
+```
+
+### `routeros_object` (data source)
 
 ```hcl
-data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
+data "routeros_object" "addresses" { path = "ip/address" }   # .response is raw JSON
 ```
 
 ## Provider configuration
@@ -68,28 +89,29 @@ data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
 ```hcl
 terraform {
   required_providers {
-    arubaos = { source = "registry.terraform.io/jamesonrgrieve/aruba-aos" }
+    routeros = { source = "registry.terraform.io/jamesonrgrieve/mikrotik-routeros" }
   }
 }
 
-provider "arubaos" {
-  host     = "192.168.2.210"     # no scheme
-  username = var.switch_user
-  password = var.switch_password # sensitive
-  insecure = true                # AOS-S self-signed cert (default true)
+provider "routeros" {
+  host     = "192.168.88.1"      # no scheme
+  username = var.routeros_user
+  password = var.routeros_password # sensitive
+  insecure = true                # RouterOS self-signed cert (default true)
+  # scheme = "https"             # or "http" (www service, v7.9+); default https
 }
 ```
 
 ## Local build / dev install
 
 ```sh
-make build          # -> terraform-provider-aruba-aos
+make build          # -> terraform-provider-mikrotik-routeros
 make install        # installs to $DEV_BIN_DIR for a dev_overrides .tfrc
 make check          # tidy + fmt + vet + test + build (pre-commit / CI gate)
 ```
 
 For runners without registry access, install into a filesystem mirror:
-`<plugins>/registry.terraform.io/JamesonRGrieve/tofu-aruba-aos/<ver>/<os>_<arch>/terraform-provider-aruba-aos`
+`<plugins>/registry.terraform.io/JamesonRGrieve/tofu-mikrotik-routeros/<ver>/<os>_<arch>/terraform-provider-mikrotik-routeros`
 and point a `.terraformrc` `provider_installation { filesystem_mirror {...} }` at it.
 
 ## License

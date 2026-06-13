@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command aruba-aos is the OpenTofu/Terraform provider plugin entrypoint for
-// ArubaOS-Switch (AOS-S) switches via the REST API v8.
+// Command mikrotik-routeros is the OpenTofu/Terraform provider plugin
+// entrypoint for MikroTik RouterOS v7+ routers via the REST API.
 package main
 
 import (
