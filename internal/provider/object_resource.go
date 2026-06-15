@@ -138,6 +138,25 @@ func extractID(raw []byte) string {
 	return s
 }
 
+// adoptByName returns the id of a pre-existing collection item under menu whose
+// "name" matches the one in body, or "" if body has no name or no item matches
+// (so the caller surfaces the original create error instead). Lets Create adopt
+// a RouterOS built-in (e.g. the "disk" logging action) rather than failing a
+// duplicate PUT.
+func adoptByName(c *routeros.Client, menu string, body []byte) string {
+	var b struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(body, &b) != nil || b.Name == "" {
+		return ""
+	}
+	id, err := c.FindByName(menu, b.Name)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
 func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var m objectModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
@@ -151,26 +170,39 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 	menu := normPath(m.Path.ValueString())
 	if m.Singleton.ValueBool() {
-		// Settings menu — PATCH the menu path directly; no .id.
-		if _, err := r.client.Patch(menu, body); err != nil {
-			resp.Diagnostics.AddError("RouterOS create (singleton PATCH) failed", err.Error())
+		// Settings menu — no item id; use the RouterOS `set` command (POST
+		// <menu>/set). A bare PATCH on the menu is rejected (HTTP 400).
+		if _, err := r.client.Set(menu, body); err != nil {
+			resp.Diagnostics.AddError("RouterOS create (singleton set) failed", err.Error())
 			return
 		}
 		m.ObjectID = types.StringValue("")
 		m.ID = types.StringValue(menu)
 	} else {
 		// Collection item — PUT to add; the reply echoes the created object,
-		// including its `.id`.
+		// including its `.id`. If PUT fails because a same-named item already
+		// exists (e.g. a RouterOS built-in logging action), adopt it: find it
+		// by name and PATCH the declared body onto the existing item.
+		id := ""
 		raw, err := r.client.Put(menu, body)
-		if err != nil {
-			resp.Diagnostics.AddError("RouterOS create (PUT) failed", err.Error())
-			return
-		}
-		id := extractID(raw)
-		if id == "" {
-			resp.Diagnostics.AddError("RouterOS create: no .id in reply",
-				fmt.Sprintf("PUT %s did not return a `.id`: %s", menu, string(raw)))
-			return
+		switch {
+		case err != nil:
+			existing := adoptByName(r.client, menu, body)
+			if existing == "" {
+				resp.Diagnostics.AddError("RouterOS create (PUT) failed", err.Error())
+				return
+			}
+			if _, perr := r.client.Patch(itemPath(menu, existing), body); perr != nil {
+				resp.Diagnostics.AddError("RouterOS create (adopt existing) failed", perr.Error())
+				return
+			}
+			id = existing
+		default:
+			if id = extractID(raw); id == "" {
+				resp.Diagnostics.AddError("RouterOS create: no .id in reply",
+					fmt.Sprintf("PUT %s did not return a `.id`: %s", menu, string(raw)))
+				return
+			}
 		}
 		m.ObjectID = types.StringValue(id)
 		m.ID = types.StringValue(itemPath(menu, id))
@@ -242,11 +274,13 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	menu := normPath(m.Path.ValueString())
-	patchPath := menu
-	if !m.Singleton.ValueBool() {
-		patchPath = itemPath(menu, m.ObjectID.ValueString())
-	}
-	if _, err := r.client.Patch(patchPath, body); err != nil {
+	if m.Singleton.ValueBool() {
+		// Settings menu — `set` command (see Create); a bare PATCH is rejected.
+		if _, err := r.client.Set(menu, body); err != nil {
+			resp.Diagnostics.AddError("RouterOS update (singleton set) failed", err.Error())
+			return
+		}
+	} else if _, err := r.client.Patch(itemPath(menu, m.ObjectID.ValueString()), body); err != nil {
 		resp.Diagnostics.AddError("RouterOS update (PATCH) failed", err.Error())
 		return
 	}

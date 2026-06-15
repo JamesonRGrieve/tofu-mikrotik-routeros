@@ -15,6 +15,7 @@ package routeros
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -139,10 +140,17 @@ func (c *Client) Put(path string, body []byte) ([]byte, error) {
 	return c.do(http.MethodPut, path, body)
 }
 
-// Patch updates a resource (collection item or singleton menu) with the given
-// JSON body.
+// Patch updates a collection item (PATCH /rest/<menu>/<id>) with the given JSON body.
 func (c *Client) Patch(path string, body []byte) ([]byte, error) {
 	return c.do(http.MethodPatch, path, body)
+}
+
+// Set updates a settings (singleton) menu via RouterOS's `set` command
+// (POST /rest/<menu>/set). A bare PATCH on a settings menu is rejected with
+// HTTP 400 "missing or invalid resource identifier" because PATCH addresses a
+// collection item by id, which a settings menu does not have.
+func (c *Client) Set(menu string, body []byte) ([]byte, error) {
+	return c.do(http.MethodPost, menu+"/set", body)
 }
 
 // Post executes a command at path with the given JSON body (e.g. /<menu>/print
@@ -153,3 +161,28 @@ func (c *Client) Post(path string, body []byte) ([]byte, error) {
 
 // Delete removes a resource.
 func (c *Client) Delete(path string) ([]byte, error) { return c.do(http.MethodDelete, path, nil) }
+
+// FindByName returns the `.id` of the item in collection menu whose `name`
+// equals name, or "" if none matches. RouterOS identifies many collection items
+// (logging actions, address lists, …) by a unique name; this lets the resource
+// adopt a pre-existing one (e.g. a built-in logging action) instead of failing
+// a duplicate PUT.
+func (c *Client) FindByName(menu, name string) (string, error) {
+	raw, err := c.Get(menu)
+	if err != nil {
+		return "", err
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return "", fmt.Errorf("decode %s collection: %w", menu, err)
+	}
+	for _, it := range items {
+		var n string
+		if json.Unmarshal(it["name"], &n) == nil && n == name {
+			var id string
+			_ = json.Unmarshal(it[".id"], &id)
+			return id, nil
+		}
+	}
+	return "", nil
+}
