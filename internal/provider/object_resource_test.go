@@ -53,6 +53,30 @@ func TestSubsetMatches(t *testing.T) {
 			wantMatched: true,
 		},
 		{
+			name:        "RouterOS boolean alias: declared no == device false — match",
+			prior:       `{".id":"*1","name":"disk","disk-stop-on-full":"false","default":"true"}`,
+			cfg:         `{"name":"disk","disk-stop-on-full":"no"}`,
+			wantMatched: true,
+		},
+		{
+			name:        "RouterOS boolean alias: declared yes == device true — match",
+			prior:       `{".id":"*2","disabled":"true"}`,
+			cfg:         `{"disabled":"yes"}`,
+			wantMatched: true,
+		},
+		{
+			name:        "boolean genuinely differs: declared no vs device true — no match",
+			prior:       `{".id":"*2","disabled":"true"}`,
+			cfg:         `{"disabled":"no"}`,
+			wantMatched: false,
+		},
+		{
+			name:        "non-boolean string unaffected by canonicalization — match",
+			prior:       `{"name":"yesman"}`,
+			cfg:         `{"name":"yesman"}`,
+			wantMatched: true,
+		},
+		{
 			name:        "invalid prior JSON — no match (fall back to diff)",
 			prior:       `not json`,
 			cfg:         `{"a":1}`,

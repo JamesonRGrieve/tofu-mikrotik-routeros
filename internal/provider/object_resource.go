@@ -380,12 +380,35 @@ func subsetMatches(prior, cfg string) bool {
 }
 
 // jsonEqual compares two raw JSON values structurally (order-insensitive).
+// Scalar strings are compared with RouterOS boolean-alias canonicalization so a
+// declared "yes"/"no" matches the device's canonical "true"/"false" (RouterOS
+// accepts the aliases on write but always reports true/false on read).
 func jsonEqual(a, b json.RawMessage) bool {
 	var av, bv any
 	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
 		return false
 	}
+	if as, aok := av.(string); aok {
+		if bs, bok := bv.(string); bok {
+			return canonBool(as) == canonBool(bs)
+		}
+	}
 	return reflect.DeepEqual(av, bv)
+}
+
+// canonBool canonicalizes a RouterOS boolean alias ("yes"/"no") to its
+// device-reported form ("true"/"false"). Any non-boolean string is returned
+// unchanged (and compared case-sensitively), so this only collapses the
+// yes↔true / no↔false equivalence and never masks a real value difference.
+func canonBool(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "yes", "true":
+		return "true"
+	case "no", "false":
+		return "false"
+	default:
+		return s
+	}
 }
 
 // compactJSON re-serializes raw JSON in compact, key-sorted-by-encoder form.
