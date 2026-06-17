@@ -100,6 +100,11 @@ func (p *routerosProvider) Configure(ctx context.Context, req provider.Configure
 	resp.DataSourceData = client
 }
 
+// Resources returns the provider's resources. There is deliberately no
+// routeros_reconcile resource (the self-healing reload the config-vs-live router
+// providers carry): a RouterOS REST PATCH/PUT applies immediately to the running
+// config — there is no staged layer that can diverge, so a 0-change plan already
+// means live matches intent, leaving no drift class to heal.
 func (p *routerosProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{NewObjectResource}
 }
